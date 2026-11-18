@@ -40,5 +40,66 @@ from ..model_cache import get_preds  # noqa: F401
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    limits = cfg["second_opinion"]
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+    issues = []
+    for image in ds.image_files():
+        stem = image.stem
+        if stem not in preds or not ds.label_path(stem).exists():
+            continue
+        size = ds.image_size(stem)
+        if size is None:
+            continue
+        width, height = size
+
+        # Giữ số dòng gốc cho FALSE_POS; bỏ dòng hỏng và ID ngoài danh sách.
+        labels = []
+        for line, text in ds.read_label_lines(stem) or []:
+            try:
+                box = parse_yolo_line(text)
+            except (ValueError, OverflowError):
+                continue
+            if 0 <= box[0] < len(ds.classes):
+                labels.append((line, box))
+
+        predictions = preds[stem]
+        for class_id, confidence, x, y, w, h in predictions:
+            if confidence < limits["conf"] or w * width * h * height < limits["min_area_px"]:
+                continue
+            candidates = []
+            for _, label in labels:
+                overlap = iou_xywh((x, y, w, h), label[1:])
+                if overlap >= limits["iou_missing"]:
+                    candidates.append((label[0], overlap))
+
+            if not candidates:
+                issues.append(Issue("second_opinion", WARN, "POSSIBLE_MISSING", stem,
+                                    f"model thấy lớp {class_id} nhưng không có box nhãn khớp",
+                                    extra={"conf": confidence}))
+                continue
+
+            same_class = [overlap for label_class, overlap in candidates if label_class == class_id]
+            if same_class:
+                best = max(same_class)
+                if best < limits["iou_loose"]:
+                    issues.append(Issue("second_opinion", WARN, "POSSIBLE_LOOSE_BOX", stem,
+                                        f"box cùng lớp {class_id} khớp chưa sát: IoU={best:.4f}",
+                                        extra={"conf": confidence, "iou": best}))
+            else:
+                best = max(overlap for _, overlap in candidates)
+                if best >= limits["iou_match"]:
+                    issues.append(Issue("second_opinion", WARN, "POSSIBLE_WRONG_CLASS", stem,
+                                        f"model dự đoán lớp {class_id}, box nhãn khớp vị trí nhưng khác lớp",
+                                        extra={"conf": confidence, "iou": best}))
+
+        # FALSE_POS dùng ngưỡng riêng và không lọc diện tích dự đoán.
+        fp_predictions = [prediction for prediction in predictions if prediction[1] >= limits["fp_conf"]]
+        for line, label in labels:
+            best = max((iou_xywh(label[1:], prediction[2:]) for prediction in fp_predictions), default=0.0)
+            if not any(iou_xywh(label[1:], prediction[2:]) >= limits["iou_missing"]
+                       for prediction in fp_predictions):
+                issues.append(Issue("second_opinion", WARN, "POSSIBLE_FALSE_POS", stem,
+                                    "box nhãn không khớp dự đoán nào đủ ngưỡng tin cậy",
+                                    line=line, extra={"iou": best}))
+    return issues
