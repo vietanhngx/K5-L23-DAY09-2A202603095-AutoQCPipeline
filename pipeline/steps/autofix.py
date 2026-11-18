@@ -31,9 +31,90 @@ from collections import defaultdict  # noqa: F401
 
 import yaml  # noqa: F401
 
-from ..common import ERROR, parse_yolo_line  # noqa: F401
+from ..common import ERROR, ROOT, parse_yolo_line
 
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    if ds.root.resolve() == (ROOT / "data" / "raw").resolve():
+        raise ValueError("Chỉ sửa bản sao làm việc, không sửa data/raw")
+
+    errors = [issue for issue in issues if issue.severity == ERROR]
+    fixes = []
+
+    def record(image, line, action, before, after):
+        fixes.append(dict(image=image, line=line, action=action, before=before, after=after))
+
+    # Loại ảnh trước để không sửa các dòng nhãn của ảnh đã bị loại.
+    removed = {issue.image for issue in errors
+               if issue.code.startswith("DUP_IMAGE_")
+               or issue.code in {"LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}}
+    for stem in sorted(removed):
+        image = ds.image_path(stem)
+        label = ds.label_path(stem)
+        existing = [p for p in (image, label) if p is not None and p.exists()]
+        if existing:
+            before = ", ".join(p.name for p in existing)
+            for path in existing:
+                path.unlink()
+            record(stem, None, "remove_image", before, "(đã loại ảnh và nhãn)")
+
+    if any(issue.code == "BAD_CLASS_NAME" for issue in errors):
+        path = ds.yaml_path
+        before = path.read_text(encoding="utf-8") if path.exists() else ""
+        data = yaml.safe_load(before) or {}
+        names = dict(enumerate(cfg["classes"]))
+        if data.get("names") != names:
+            data["names"] = names
+            after = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+            path.write_text(after, encoding="utf-8")
+            record("data.yaml", None, "rename_classes", before, after)
+
+    needs_label = {issue.image for issue in errors if issue.code == "MISSING_LABEL_FILE"}
+    for stem in sorted(needs_label - removed):
+        if ds.image_path(stem) is not None and not ds.label_path(stem).exists():
+            record(stem, None, "needs_label", "(không có file)", "chuyển người gán")
+
+    drop_codes = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+    grouped = defaultdict(lambda: defaultdict(set))
+    for issue in errors:
+        if issue.image not in removed and issue.line is not None:
+            if issue.code in drop_codes or issue.code == "BOX_OUT_OF_IMAGE":
+                grouped[issue.image][issue.line].add(issue.code)
+
+    for stem, line_codes in sorted(grouped.items()):
+        path = ds.label_path(stem)
+        if not path.exists():
+            continue
+        before_file = path.read_text(encoding="utf-8", errors="replace")
+        output = []
+        changed = False
+        # Duyệt toàn bộ dòng gốc, kể cả dòng trống; chỉ ghi file một lần.
+        for number, text in enumerate(before_file.splitlines(), 1):
+            codes = line_codes.get(number, set())
+            if codes & drop_codes:
+                record(stem, number, "drop_line", text, "")
+                changed = True
+                continue
+            if "BOX_OUT_OF_IMAGE" in codes:
+                try:
+                    class_id, x, y, w, h = parse_yolo_line(text)
+                except (ValueError, OverflowError):
+                    record(stem, number, "drop_line", text, "")
+                    changed = True
+                    continue
+                left, right = max(0.0, x - w / 2), min(1.0, x + w / 2)
+                top, bottom = max(0.0, y - h / 2), min(1.0, y + h / 2)
+                if right <= left or bottom <= top:
+                    record(stem, number, "drop_line", text, "")
+                    changed = True
+                    continue
+                if left != x - w / 2 or right != x + w / 2 or top != y - h / 2 or bottom != y + h / 2:
+                    coords = ((left + right) / 2, (top + bottom) / 2, right - left, bottom - top)
+                    after = f"{class_id} " + " ".join(f"{value:.12g}" for value in coords)
+                    record(stem, number, "clip_box", text, after)
+                    text = after
+                    changed = True
+            output.append(text)
+        if changed:
+            path.write_text("\n".join(output) + ("\n" if output else ""), encoding="utf-8")
+    return fixes
